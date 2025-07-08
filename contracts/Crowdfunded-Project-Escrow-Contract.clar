@@ -12,6 +12,12 @@
 (define-constant err-project-not-active (err u110))
 (define-constant err-insufficient-funds (err u111))
 
+(define-constant err-milestone-not-found (err u200))
+(define-constant err-milestone-already-claimed (err u201))
+(define-constant err-milestone-invalid-percentage (err u202))
+(define-constant err-milestone-conditions-not-met (err u203))
+(define-constant err-milestone-limit-exceeded (err u204))
+
 (define-data-var next-project-id uint u1)
 
 (define-map projects
@@ -264,5 +270,92 @@
       (merge project-data { refunded: true, active: false })
     )
     (ok true)
+  )
+)
+
+(define-map project-milestones
+  { project-id: uint, milestone-id: uint }
+  {
+    title: (string-ascii 100),
+    description: (string-ascii 300),
+    percentage: uint,
+    unlock-condition: (string-ascii 200),
+    claimed: bool,
+    claim-deadline: uint
+  }
+)
+
+(define-map milestone-count
+  { project-id: uint }
+  { count: uint }
+)
+
+(define-read-only (get-milestone (project-id uint) (milestone-id uint))
+  (ok (map-get? project-milestones { project-id: project-id, milestone-id: milestone-id }))
+)
+
+(define-read-only (get-milestone-count (project-id uint))
+  (ok (default-to u0 (get count (map-get? milestone-count { project-id: project-id }))))
+)
+
+(define-read-only (calculate-milestone-amount (project-id uint) (milestone-id uint))
+  (match (map-get? projects { project-id: project-id })
+    project-data
+    (match (map-get? project-milestones { project-id: project-id, milestone-id: milestone-id })
+      milestone-data
+      (ok (/ (* (get total-raised project-data) (get percentage milestone-data)) u100))
+      (err err-milestone-not-found)
+    )
+    (err err-not-found)
+  )
+)
+
+(define-public (create-milestone (project-id uint) (title (string-ascii 100)) (description (string-ascii 300)) (percentage uint) (unlock-condition (string-ascii 200)) (claim-deadline uint))
+  (let
+    (
+      (project-data (unwrap! (map-get? projects { project-id: project-id }) err-not-found))
+      (current-count (default-to u0 (get count (map-get? milestone-count { project-id: project-id }))))
+      (new-milestone-id (+ current-count u1))
+    )
+    (asserts! (is-eq tx-sender (get creator project-data)) err-unauthorized)
+    (asserts! (and (> percentage u0) (<= percentage u100)) err-milestone-invalid-percentage)
+    (asserts! (< current-count u10) err-milestone-limit-exceeded)
+    (asserts! (> claim-deadline stacks-block-height) err-invalid-deadline)
+    (map-set project-milestones
+      { project-id: project-id, milestone-id: new-milestone-id }
+      {
+        title: title,
+        description: description,
+        percentage: percentage,
+        unlock-condition: unlock-condition,
+        claimed: false,
+        claim-deadline: claim-deadline
+      }
+    )
+    (map-set milestone-count
+      { project-id: project-id }
+      { count: new-milestone-id }
+    )
+    (ok new-milestone-id)
+  )
+)
+
+(define-public (claim-milestone (project-id uint) (milestone-id uint))
+  (let
+    (
+      (project-data (unwrap! (map-get? projects { project-id: project-id }) err-not-found))
+      (milestone-data (unwrap! (map-get? project-milestones { project-id: project-id, milestone-id: milestone-id }) err-milestone-not-found))
+      (milestone-amount (unwrap! (calculate-milestone-amount project-id milestone-id) err-milestone-not-found))
+    )
+    (asserts! (is-eq tx-sender (get creator project-data)) err-unauthorized)
+    (asserts! (not (get claimed milestone-data)) err-milestone-already-claimed)
+    (asserts! (< stacks-block-height (get claim-deadline milestone-data)) err-deadline-passed)
+    (asserts! (>= (get total-raised project-data) (get funding-goal project-data)) err-goal-not-reached)
+    (try! (as-contract (stx-transfer? milestone-amount tx-sender (get creator project-data))))
+    (map-set project-milestones
+      { project-id: project-id, milestone-id: milestone-id }
+      (merge milestone-data { claimed: true })
+    )
+    (ok milestone-amount)
   )
 )
