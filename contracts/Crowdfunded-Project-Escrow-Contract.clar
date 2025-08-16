@@ -18,6 +18,9 @@
 (define-constant err-milestone-conditions-not-met (err u203))
 (define-constant err-milestone-limit-exceeded (err u204))
 
+(define-constant err-update-limit-exceeded (err u300))
+(define-constant err-empty-update (err u301))
+
 (define-data-var next-project-id uint u1)
 
 (define-map projects
@@ -357,5 +360,70 @@
       (merge milestone-data { claimed: true })
     )
     (ok milestone-amount)
+  )
+)
+
+
+(define-map project-updates
+  { project-id: uint, update-id: uint }
+  {
+    title: (string-ascii 100),
+    content: (string-ascii 1000),
+    timestamp: uint,
+    block-height: uint
+  }
+)
+
+(define-map update-count
+  { project-id: uint }
+  { count: uint }
+)
+
+(define-read-only (get-update (project-id uint) (update-id uint))
+  (ok (map-get? project-updates { project-id: project-id, update-id: update-id }))
+)
+
+(define-read-only (get-update-count (project-id uint))
+  (ok (default-to u0 (get count (map-get? update-count { project-id: project-id }))))
+)
+
+(define-read-only (get-latest-update (project-id uint))
+  (let
+    (
+      (total-updates (default-to u0 (get count (map-get? update-count { project-id: project-id }))))
+    )
+    (if (> total-updates u0)
+      (ok (map-get? project-updates { project-id: project-id, update-id: total-updates }))
+      (ok none)
+    )
+  )
+)
+
+(define-public (post-update (project-id uint) (title (string-ascii 100)) (content (string-ascii 1000)))
+  (let
+    (
+      (project-data (unwrap! (map-get? projects { project-id: project-id }) err-not-found))
+      (current-count (default-to u0 (get count (map-get? update-count { project-id: project-id }))))
+      (new-update-id (+ current-count u1))
+    )
+    (asserts! (is-eq tx-sender (get creator project-data)) err-unauthorized)
+    (asserts! (get active project-data) err-project-not-active)
+    (asserts! (> (len title) u0) err-empty-update)
+    (asserts! (> (len content) u0) err-empty-update)
+    (asserts! (< current-count u50) err-update-limit-exceeded)
+    (map-set project-updates
+      { project-id: project-id, update-id: new-update-id }
+      {
+        title: title,
+        content: content,
+        timestamp: stacks-block-height,
+        block-height: stacks-block-height
+      }
+    )
+    (map-set update-count
+      { project-id: project-id }
+      { count: new-update-id }
+    )
+    (ok new-update-id)
   )
 )
