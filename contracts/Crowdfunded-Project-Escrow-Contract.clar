@@ -21,6 +21,12 @@
 (define-constant err-update-limit-exceeded (err u300))
 (define-constant err-empty-update (err u301))
 
+(define-constant err-rating-unauthorized (err u400))
+(define-constant err-rating-invalid-score (err u401))
+(define-constant err-rating-already-submitted (err u402))
+(define-constant err-rating-project-not-completed (err u403))
+
+
 (define-data-var next-project-id uint u1)
 
 (define-map projects
@@ -425,5 +431,94 @@
       { count: new-update-id }
     )
     (ok new-update-id)
+  )
+)
+
+(define-map project-ratings
+  { project-id: uint, contributor: principal }
+  { score: uint, comment: (string-ascii 200) }
+)
+
+(define-map project-rating-summary
+  { project-id: uint }
+  { 
+    total-score: uint,
+    rating-count: uint,
+    average-score: uint
+  }
+)
+
+(define-map creator-reputation
+  { creator: principal }
+  {
+    total-projects-rated: uint,
+    cumulative-score: uint,
+    average-reputation: uint
+  }
+)
+
+(define-read-only (get-project-rating (project-id uint) (contributor principal))
+  (ok (map-get? project-ratings { project-id: project-id, contributor: contributor }))
+)
+
+(define-read-only (get-project-rating-summary (project-id uint))
+  (ok (map-get? project-rating-summary { project-id: project-id }))
+)
+
+(define-read-only (get-creator-reputation (creator principal))
+  (ok (map-get? creator-reputation { creator: creator }))
+)
+
+(define-public (rate-project (project-id uint) (score uint) (comment (string-ascii 200)))
+  (let
+    (
+      (project-data (unwrap! (map-get? projects { project-id: project-id }) err-not-found))
+      (contribution-data (unwrap! (map-get? contributions { project-id: project-id, contributor: tx-sender }) err-rating-unauthorized))
+      (current-summary (default-to { total-score: u0, rating-count: u0, average-score: u0 } (map-get? project-rating-summary { project-id: project-id })))
+      (creator (get creator project-data))
+      (current-reputation (default-to { total-projects-rated: u0, cumulative-score: u0, average-reputation: u0 } (map-get? creator-reputation { creator: creator })))
+    )
+    (asserts! (and (>= score u1) (<= score u5)) err-rating-invalid-score)
+    (asserts! (get claimed project-data) err-rating-project-not-completed)
+    (asserts! (is-none (map-get? project-ratings { project-id: project-id, contributor: tx-sender })) err-rating-already-submitted)
+    
+    (map-set project-ratings
+      { project-id: project-id, contributor: tx-sender }
+      { score: score, comment: comment }
+    )
+    
+    (let
+      (
+        (new-total-score (+ (get total-score current-summary) score))
+        (new-rating-count (+ (get rating-count current-summary) u1))
+        (new-average (/ new-total-score new-rating-count))
+      )
+      (map-set project-rating-summary
+        { project-id: project-id }
+        { 
+          total-score: new-total-score,
+          rating-count: new-rating-count,
+          average-score: new-average
+        }
+      )
+      
+      (let
+        (
+          (new-projects-rated (+ (get total-projects-rated current-reputation) u1))
+          (new-cumulative (+ (get cumulative-score current-reputation) score))
+          (new-reputation-avg (/ new-cumulative new-projects-rated))
+        )
+        (map-set creator-reputation
+          { creator: creator }
+          {
+            total-projects-rated: new-projects-rated,
+            cumulative-score: new-cumulative,
+            average-reputation: new-reputation-avg
+          }
+        )
+      )
+    )
+    
+    (ok score)
   )
 )
