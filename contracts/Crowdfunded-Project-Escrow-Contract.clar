@@ -26,6 +26,11 @@
 (define-constant err-rating-already-submitted (err u402))
 (define-constant err-rating-project-not-completed (err u403))
 
+(define-constant err-emergency-already-initiated (err u500))
+(define-constant err-emergency-not-active (err u501))
+(define-constant err-emergency-threshold-not-met (err u502))
+(define-constant err-emergency-already-voted (err u503))
+(define-constant err-emergency-cooldown-active (err u504))
 
 (define-data-var next-project-id uint u1)
 
@@ -520,5 +525,112 @@
     )
     
     (ok score)
+  )
+)
+
+(define-map emergency-withdrawal-status
+  { project-id: uint }
+  {
+    active: bool,
+    vote-count: uint,
+    total-votes-required: uint,
+    initiation-height: uint,
+    resolution-deadline: uint
+  }
+)
+
+(define-map emergency-votes
+  { project-id: uint, voter: principal }
+  { voted: bool, vote-height: uint }
+)
+
+(define-read-only (get-emergency-status (project-id uint))
+  (ok (map-get? emergency-withdrawal-status { project-id: project-id }))
+)
+
+(define-read-only (has-voted-emergency (project-id uint) (voter principal))
+  (ok (default-to false (get voted (map-get? emergency-votes { project-id: project-id, voter: voter }))))
+)
+
+(define-read-only (calculate-proportional-share (project-id uint) (contributor principal))
+  (match (map-get? projects { project-id: project-id })
+    project-data
+    (match (map-get? contributions { project-id: project-id, contributor: contributor })
+      contribution-data
+      (ok (/ (* (get amount contribution-data) u10000) (get total-raised project-data)))
+      (err err-not-found)
+    )
+    (err err-not-found)
+  )
+)
+
+(define-public (initiate-emergency-withdrawal (project-id uint))
+  (let
+    (
+      (project-data (unwrap! (map-get? projects { project-id: project-id }) err-not-found))
+      (contribution-data (unwrap! (map-get? contributions { project-id: project-id, contributor: tx-sender }) err-unauthorized))
+      (contributors-list (default-to (list) (get contributors (map-get? project-contributors { project-id: project-id }))))
+      (total-contributors (len contributors-list))
+      (votes-needed (/ (* total-contributors u60) u100))
+    )
+    (asserts! (>= (get total-raised project-data) (get funding-goal project-data)) err-goal-not-reached)
+    (asserts! (>= stacks-block-height (+ (get deadline project-data) u144)) err-emergency-cooldown-active)
+    (asserts! (not (get claimed project-data)) err-already-claimed)
+    (asserts! (is-none (map-get? emergency-withdrawal-status { project-id: project-id })) err-emergency-already-initiated)
+    (map-set emergency-withdrawal-status
+      { project-id: project-id }
+      {
+        active: true,
+        vote-count: u1,
+        total-votes-required: votes-needed,
+        initiation-height: stacks-block-height,
+        resolution-deadline: (+ stacks-block-height u1008)
+      }
+    )
+    (map-set emergency-votes
+      { project-id: project-id, voter: tx-sender }
+      { voted: true, vote-height: stacks-block-height }
+    )
+    (ok true)
+  )
+)
+
+(define-public (vote-emergency-withdrawal (project-id uint))
+  (let
+    (
+      (emergency-data (unwrap! (map-get? emergency-withdrawal-status { project-id: project-id }) err-emergency-not-active))
+      (contribution-data (unwrap! (map-get? contributions { project-id: project-id, contributor: tx-sender }) err-unauthorized))
+      (has-voted (default-to false (get voted (map-get? emergency-votes { project-id: project-id, voter: tx-sender }))))
+      (new-vote-count (+ (get vote-count emergency-data) u1))
+    )
+    (asserts! (get active emergency-data) err-emergency-not-active)
+    (asserts! (< stacks-block-height (get resolution-deadline emergency-data)) err-deadline-passed)
+    (asserts! (not has-voted) err-emergency-already-voted)
+    (map-set emergency-votes
+      { project-id: project-id, voter: tx-sender }
+      { voted: true, vote-height: stacks-block-height }
+    )
+    (map-set emergency-withdrawal-status
+      { project-id: project-id }
+      (merge emergency-data { vote-count: new-vote-count })
+    )
+    (ok new-vote-count)
+  )
+)
+
+(define-public (execute-emergency-withdrawal (project-id uint))
+  (let
+    (
+      (project-data (unwrap! (map-get? projects { project-id: project-id }) err-not-found))
+      (emergency-data (unwrap! (map-get? emergency-withdrawal-status { project-id: project-id }) err-emergency-not-active))
+      (contribution-data (unwrap! (map-get? contributions { project-id: project-id, contributor: tx-sender }) err-unauthorized))
+      (proportional-basis (unwrap! (calculate-proportional-share project-id tx-sender) err-not-found))
+      (withdrawal-amount (/ (* (get total-raised project-data) proportional-basis) u10000))
+    )
+    (asserts! (get active emergency-data) err-emergency-not-active)
+    (asserts! (>= (get vote-count emergency-data) (get total-votes-required emergency-data)) err-emergency-threshold-not-met)
+    (try! (as-contract (stx-transfer? withdrawal-amount tx-sender tx-sender)))
+    (map-delete contributions { project-id: project-id, contributor: tx-sender })
+    (ok withdrawal-amount)
   )
 )
