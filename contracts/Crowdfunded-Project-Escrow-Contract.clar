@@ -32,6 +32,13 @@
 (define-constant err-emergency-already-voted (err u503))
 (define-constant err-emergency-cooldown-active (err u504))
 
+(define-constant err-schedule-exists (err u600))
+(define-constant err-schedule-not-found (err u601))
+(define-constant err-schedule-invalid-config (err u602))
+(define-constant err-schedule-not-unlocked (err u603))
+(define-constant err-schedule-already-claimed (err u604))
+(define-constant err-schedule-exceeds-total (err u605))
+
 (define-data-var next-project-id uint u1)
 
 (define-map projects
@@ -632,5 +639,111 @@
     (try! (as-contract (stx-transfer? withdrawal-amount tx-sender tx-sender)))
     (map-delete contributions { project-id: project-id, contributor: tx-sender })
     (ok withdrawal-amount)
+  )
+)
+
+
+(define-map withdrawal-schedules
+  { project-id: uint }
+  {
+    intervals: uint,
+    interval-duration: uint,
+    start-block: uint,
+    amount-per-interval: uint,
+    total-scheduled: uint
+  }
+)
+
+(define-map schedule-claims
+  { project-id: uint }
+  { intervals-claimed: uint, total-claimed: uint }
+)
+
+(define-read-only (get-withdrawal-schedule (project-id uint))
+  (ok (map-get? withdrawal-schedules { project-id: project-id }))
+)
+
+(define-read-only (get-schedule-claims (project-id uint))
+  (ok (map-get? schedule-claims { project-id: project-id }))
+)
+
+(define-read-only (calculate-unlocked-intervals (project-id uint))
+  (match (map-get? withdrawal-schedules { project-id: project-id })
+    schedule
+    (let
+      (
+        (blocks-elapsed (- stacks-block-height (get start-block schedule)))
+        (unlocked (/ blocks-elapsed (get interval-duration schedule)))
+      )
+      (ok (if (> unlocked (get intervals schedule))
+            (get intervals schedule)
+            unlocked))
+    )
+    (err err-schedule-not-found)
+  )
+)
+
+(define-read-only (calculate-claimable-amount (project-id uint))
+  (match (map-get? withdrawal-schedules { project-id: project-id })
+    schedule
+    (let
+      (
+        (unlocked-intervals (unwrap! (calculate-unlocked-intervals project-id) err-schedule-not-found))
+        (claims (default-to { intervals-claimed: u0, total-claimed: u0 } (map-get? schedule-claims { project-id: project-id })))
+        (claimable-intervals (- unlocked-intervals (get intervals-claimed claims)))
+      )
+      (ok (* claimable-intervals (get amount-per-interval schedule)))
+    )
+    (ok u0)
+  )
+)
+
+(define-public (create-withdrawal-schedule (project-id uint) (intervals uint) (interval-duration uint))
+  (let
+    (
+      (project-data (unwrap! (map-get? projects { project-id: project-id }) err-not-found))
+      (amount-per-interval (/ (get total-raised project-data) intervals))
+      (total-scheduled (* amount-per-interval intervals))
+    )
+    (asserts! (is-eq tx-sender (get creator project-data)) err-unauthorized)
+    (asserts! (>= (get total-raised project-data) (get funding-goal project-data)) err-goal-not-reached)
+    (asserts! (>= stacks-block-height (get deadline project-data)) err-deadline-not-passed)
+    (asserts! (is-none (map-get? withdrawal-schedules { project-id: project-id })) err-schedule-exists)
+    (asserts! (and (> intervals u0) (<= intervals u24)) err-schedule-invalid-config)
+    (asserts! (> interval-duration u0) err-schedule-invalid-config)
+    (map-set withdrawal-schedules
+      { project-id: project-id }
+      {
+        intervals: intervals,
+        interval-duration: interval-duration,
+        start-block: stacks-block-height,
+        amount-per-interval: amount-per-interval,
+        total-scheduled: total-scheduled
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-scheduled-withdrawal (project-id uint))
+  (let
+    (
+      (project-data (unwrap! (map-get? projects { project-id: project-id }) err-not-found))
+      (schedule (unwrap! (map-get? withdrawal-schedules { project-id: project-id }) err-schedule-not-found))
+      (claimable (unwrap! (calculate-claimable-amount project-id) err-schedule-not-found))
+      (claims (default-to { intervals-claimed: u0, total-claimed: u0 } (map-get? schedule-claims { project-id: project-id })))
+      (unlocked-intervals (unwrap! (calculate-unlocked-intervals project-id) err-schedule-not-found))
+    )
+    (asserts! (is-eq tx-sender (get creator project-data)) err-unauthorized)
+    (asserts! (> claimable u0) err-schedule-not-unlocked)
+    (try! (as-contract (stx-transfer? claimable tx-sender (get creator project-data))))
+    (map-set schedule-claims
+      { project-id: project-id }
+      { 
+        intervals-claimed: unlocked-intervals,
+        total-claimed: (+ (get total-claimed claims) claimable)
+      }
+    )
+    (ok claimable)
   )
 )
